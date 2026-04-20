@@ -42,9 +42,9 @@ workspace/{task_id}/                      # 任务工作区，task_id = YYYYMMDD
 1. 识别群聊，获取 group_wxid（用 search_contacts 搜索群名）
 2. 生成任务ID（格式：`{YYYYMMDD_HHMMSS}`）
 3. 创建 `workspace/{task_id}/progress.md`，写入初始进度表
-4. 按3天为最小单位拉取群全量数据（大于3天必须拆分，每次最大只传3天时间）：
+4. 按天拉取群全量数据（跨天必须拆分，每次只传同一天）：
    ```
-   对日期范围内每个3天时间：
+   对日期范围内每一天：
      get_messages(group_wxid, {date} 00:00:00, {date} 23:59:59, data/{group_wxid}/{YYYYMMDD_HHMMSS}.json)
      python analyzer/verify.py arg data/{group_wxid}/{stem}.json
    ```
@@ -102,8 +102,8 @@ workspace/{task_id}/                      # 任务工作区，task_id = YYYYMMDD
 # {group_wxid} | {task_id}
 
 ## 数据收集
-- [x] 2026-04-15~17 → data/{group_wxid}/{file1}.json
-- [x] 2026-04-18~20 → data/{group_wxid}/{file2}.json
+- [x] 2026-04-17 → data/{group_wxid}/{file1}.json
+- [x] 2026-04-18 → data/{group_wxid}/{file2}.json
 
 ## 成员分析
 - [ ] {wxid_a} → workspace/{task_id}/extract_{wxid_a}.md
