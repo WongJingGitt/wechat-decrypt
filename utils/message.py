@@ -3,12 +3,17 @@
 提供 MessageDB 类，封装 message_*.db 的连接和查询。
 """
 
+import os
 import re
 import sqlite3
 import hashlib
+import sys
+from pathlib import Path
+
 import zstandard
 from dataclasses import dataclass, field
 from typing import List, Optional
+from datetime import datetime
 
 import xmltodict
 from enum import IntEnum, Enum
@@ -20,6 +25,15 @@ try:
 except ImportError:
     from db import _cache, ALL_KEYS
     from contact import ContactDB
+
+try:
+    from ..decode_image import ImageResolver
+except ImportError:
+    # utils 作为顶层包导入时，..decode_image 无法使用相对路径，改用绝对路径
+    _parent_dir = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+    if _parent_dir not in sys.path:
+        sys.path.insert(0, _parent_dir)
+    from decode_image import ImageResolver
 
 
 class MessageType(IntEnum):
@@ -55,6 +69,7 @@ class XMLMessageType(Enum):
     AUDIO_MESSAGE = "92"    # 音频类消息，测试是来自QQ音乐的可直接播放的卡片
     GROUP_NOTICE = "87"  # 群公告的@全体成员消息
     FILE = "6"  # 文件
+    TRANSFER = "2000"
 
 
 @dataclass
@@ -196,7 +211,7 @@ class MessageProcessor:
         base_info = {
             "sender": item.sender_wxid,
             "server_id": item.server_id,
-            "timestamp": item.create_time,
+            "create_time": datetime.fromtimestamp(item.create_time).strftime("%Y-%m-%d %H:%M:%S"),
             "select_wxid": item.select_wxid,
             "at_user_list": item.at_user_list,
             "local_id": item.local_id
@@ -223,21 +238,65 @@ class MessageProcessor:
         }
 
     def _process_image(self, item: MessageItem) -> dict:
-        return {
+        """解析图片消息，从 XML 中提取 md5/hdimgmd5 用于后续图片解密"""
+        img_info = {}
+        try:
+            xml_dict = item.original_message
+            if isinstance(xml_dict, dict):
+                img = xml_dict.get('msg', {}).get('img', {})
+                if isinstance(img, dict):
+                    # md5/hdimgmd5: 图片文件MD5，hdimgmd5 是高清图，md5 是普通图
+                    for key in ('hdimgmd5', 'md5', 'imgmd5'):
+                        val = img.get(f'@{key}') or img.get(key)
+                        if val and len(val) == 32:
+                            img_info[key] = val
+                    # aeskey/encryver: 仅用于参考（本地文件解密不依赖这两个字段）
+                    for key in ('aeskey', 'encryver'):
+                        val = img.get(f'@{key}') or img.get(key)
+                        if val:
+                            img_info[key] = val
+        except Exception:
+            pass
+
+        # 优先使用 hdimgmd5（高清图），其次 md5
+        xml_md5 = img_info.get('hdimgmd5') or img_info.get('md5') or img_info.get('imgmd5')
+
+        result = {
             "type": "图片消息",
             "content": "[图片]",
         }
+        if xml_md5:
+            result["xml_md5"] = xml_md5
+        return result
 
     def _process_voice(self, item: MessageItem) -> dict:
+        voice_length = item.original_message.get('msg', {}).get('voicemsg', {}).get('@voicelength')
+        try:
+            voice_length = int(voice_length)
+        except ValueError:
+            voice_length = None
+        if voice_length is not None:
+            content = f"[语音] {voice_length / 1000:.1f}s"
+        else:
+            content = "[语音]"
+
         return {
             "type": "语音消息",
-            "content": "[语音]",
+            "content": content,
         }
 
     def _process_video(self, item: MessageItem) -> dict:
+        content = "[视频]"
+        play_length = item.original_message.get('msg', {}).get('videomsg', {}).get('@playlength')
+        try:
+            play_length = int(play_length)
+            content = f"[视频] {play_length:.1f}s"
+        except Exception as e:
+            pass
+
         return {
             "type": "视频消息",
-            "content": "[视频]",
+            "content": content,
         }
 
     def _process_emoji(self, item: MessageItem) -> dict:
@@ -342,6 +401,7 @@ class MessageProcessor:
             "6": lambda: self._process_file(appmsg),
             "3": lambda: self._process_audio(appmsg, appinfo),
             "92": lambda: self._process_audio(appmsg, appinfo),
+            "2000": lambda : self._process_transfer(appmsg),
         }
 
         handler = handlers.get(xml_type)
@@ -413,7 +473,7 @@ class MessageProcessor:
             "type": "引用消息",
             "content": f"{title}",
             "refer_svrid": refermsg.get("svrid", ""),
-            "refer_fromusr": refermsg.get("fromusr", ""),
+            "refer_fromusr": refermsg.get("chatusr", ""),
             "refer_displayname": refermsg.get("displayname", ""),
         }
 
@@ -486,6 +546,16 @@ class MessageProcessor:
             "content": content,
         }
 
+    def _process_transfer(self, appmsg: dict):
+        receiver_username = appmsg.get('wcpayinfo', {}).get('receiver_username')
+        transcation_id = appmsg.get('wcpayinfo', {}).get('transcationid')
+        return {
+            "type": "转账",
+            "content": f"[微信转账] {appmsg.get('wcpayinfo', {}).get('feedesc', '')}",
+            "receiver_username": receiver_username,
+            "transcation_id": transcation_id,
+        }
+
 
 @dataclass
 class DBConnectionItem:
@@ -506,8 +576,16 @@ class DBConnectionItem:
         table_list = self.get_table_by_wxid(wxid)
         if not table_list:
             return []
-        start_time_stamp = int(dateutil_parser.parse(start_time).timestamp())
-        end_time_stamp = int(dateutil_parser.parse(end_time).timestamp())
+        start_datatime = dateutil_parser.parse(start_time)
+        end_datatime = dateutil_parser.parse(end_time)
+        # 如果是同一天，并且开始时间和结束时间相同，则扩大查询范围到当天的 00:00:00 - 23:59:59
+        if start_datatime.date() == end_datatime.date() and start_datatime.time() == end_datatime.time():
+            start_datatime = start_datatime.replace(hour=0, minute=0, second=0)
+            end_datatime = end_datatime.replace(hour=23, minute=59, second=59)
+
+        start_time_stamp = int(start_datatime.timestamp())
+        end_time_stamp = int(end_datatime.timestamp())
+
         if end_time_stamp < start_time_stamp:
             start_time_stamp, end_time_stamp = end_time_stamp, start_time_stamp
         limit = f"LIMIT {limit}" if isinstance(limit, int) else ""
@@ -520,7 +598,11 @@ class DBConnectionItem:
               f"AND m.create_time <= {end_time_stamp} " \
               f"ORDER BY m.create_time ASC {limit};"
 
-        return [MessageItem(*[*_item, wxid]) for _item in self.run(sql).fetchall()]
+        try:
+            return [MessageItem(*[*_item, wxid]) for _item in self.run(sql).fetchall()]
+        except sqlite3.DatabaseError as e:
+            print(f"[DBConnectionItem] query failed on {self.key}: {e}", flush=True)
+            return []
 
     def run(self, sql: str, *args) -> sqlite3.Cursor:
         return self.connect.execute(sql, args)
@@ -543,10 +625,27 @@ class MessageDB:
     @property
     def all_db_connection(self) -> List[DBConnectionItem]:
         if self.__all_message_db_connection is None:
-            self.__all_message_db_connection = [
-                DBConnectionItem(item, sqlite3.connect(_cache.get(item)))
-                for item in self.__all_db_file
-            ]
+            connections = []
+            for item in self.__all_db_file:
+                path = _cache.get(item)
+                if path is None:
+                    continue
+                try:
+                    conn = sqlite3.connect(path)
+                    conn.execute("SELECT 1")  # validate
+                    connections.append(DBConnectionItem(item, conn))
+                except sqlite3.DatabaseError as e:
+                    print(f"[MessageDB] cached db malformed ({item}), force re-decrypt: {e}", flush=True)
+                    # 清除缓存条目，强制重新解密
+                    _cache._cache.pop(item, None)
+                    path = _cache.get(item, force=True)
+                    if path:
+                        try:
+                            conn = sqlite3.connect(path)
+                            connections.append(DBConnectionItem(item, conn))
+                        except sqlite3.DatabaseError as e2:
+                            print(f"[MessageDB] skip malformed db {item}: {e2}", flush=True)
+            self.__all_message_db_connection = connections
         return self.__all_message_db_connection
 
     def close_all(self):

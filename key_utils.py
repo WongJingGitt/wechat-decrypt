@@ -22,6 +22,7 @@ def key_path_variants(rel_path):
         normalized,
         normalized.replace("/", "\\"),
         normalized.replace("/", os.sep),
+        normalized.replace("/", "\\\\"),  # 双反斜杠 (兼容某些JSON key格式)
     ):
         if candidate not in variants:
             variants.append(candidate)
