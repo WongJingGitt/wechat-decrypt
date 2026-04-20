@@ -22,6 +22,15 @@ import glob
 import hashlib
 import sqlite3
 import struct
+import json
+
+# 加载配置
+_SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
+CONFIG_FILE = os.path.join(_SCRIPT_DIR, "config.json")
+_cfg = {}
+if os.path.exists(CONFIG_FILE):
+    with open(CONFIG_FILE, encoding="utf-8") as f:
+        _cfg = json.load(f)
 
 # V2 格式完整 magic (6 bytes)
 V2_MAGIC = b'\x07\x08\x56\x32'       # 前 4 字节用于快速检测
@@ -111,14 +120,14 @@ def detect_image_format(header_bytes):
     return 'bin'
 
 
-def v2_decrypt_file(dat_path, out_path=None, aes_key=None, xor_key=0x88):
+def v2_decrypt_file(dat_path, out_path=None, aes_key=None, xor_key=None):
     """解密 V2 格式 .dat 文件 (AES-ECB + XOR)
 
     Args:
         dat_path: V2 .dat 文件路径
         out_path: 输出路径 (None 则自动命名)
         aes_key: 16 字节 AES key (bytes 或 str)
-        xor_key: XOR key (int, 默认 0x88)
+        xor_key: XOR key (int, 默认从 config 读取)
 
     Returns:
         (output_path, format) 或 (None, None)
@@ -126,8 +135,11 @@ def v2_decrypt_file(dat_path, out_path=None, aes_key=None, xor_key=0x88):
     if aes_key is None:
         return None, None
 
+    # 默认 XOR key 从 config 读取
+    if xor_key is None:
+        xor_key = _cfg.get("image_xor_key", 0x88)
+
     from Crypto.Cipher import AES
-    from Crypto.Util import Padding
 
     # 确保 key 是 16 字节 bytes
     if isinstance(aes_key, str):
@@ -152,20 +164,18 @@ def v2_decrypt_file(dat_path, out_path=None, aes_key=None, xor_key=0x88):
     if sig == V1_MAGIC_FULL:
         aes_key = b'cfcd208495d565ef'  # md5("0")[:16]
 
-    # AES 对齐: PKCS7 填充使实际密文 >= aes_size，向上对齐到 16
-    # 当 aes_size 是 16 的倍数时，还需要加 16 (完整填充块)
-    aligned_aes_size = aes_size
-    aligned_aes_size -= ~(~aligned_aes_size % 16)  # 同 wx-dat 的公式
+    # AES 对齐: PKCS7 填充使密文长度是 16 的倍数
+    aligned_aes_size = (aes_size + 15) // 16 * 16
 
     offset = 15
     if offset + aligned_aes_size > len(data):
         return None, None
 
-    # AES-ECB 解密
+    # AES-ECB 解密 (直接截取 aes_size 字节，不 unpad)
     aes_data = data[offset:offset + aligned_aes_size]
     try:
         cipher = AES.new(aes_key[:16], AES.MODE_ECB)
-        dec_aes = Padding.unpad(cipher.decrypt(aes_data), AES.block_size)
+        dec_aes = cipher.decrypt(aes_data)[:aes_size]
     except (ValueError, KeyError):
         return None, None
     offset += aligned_aes_size
@@ -180,11 +190,28 @@ def v2_decrypt_file(dat_path, out_path=None, aes_key=None, xor_key=0x88):
     dec_xor = bytes(b ^ xor_key for b in xor_data)
 
     decrypted = dec_aes + raw_data + dec_xor
-    fmt = detect_image_format(decrypted[:16])
 
-    # wxgf (HEVC 裸流) 格式
+    # wxgf (HEVC 裸流) 格式必须在 detect_image_format 前检测（后者会返回 'bin'）
     if decrypted[:4] == b'wxgf':
         fmt = 'hevc'
+    else:
+        fmt = detect_image_format(decrypted[:16])
+
+    # 格式未识别 → AES key 错误（解密产生随机字节），直接失败
+    if fmt == 'bin':
+        return None, None
+
+    # V2 格式已通过 aes_size / xor_size 字段精确编码各段长度，decrypted 就是完整图片。
+    # 不需要搜索结束标记 —— 搜索反而会因 EXIF 内嵌缩略图的 FF D9 等在中间截断图片。
+    #
+    # 通过尾部特征校验 XOR key 是否正确（xor_size=0 时跳过，无 XOR 段无法验证）：
+    if xor_size >= 2:
+        if fmt == 'jpg' and decrypted[-2:] != bytes([0xFF, 0xD9]):
+            # 末尾不是 FF D9 → XOR key 错误，拒绝写出乱码文件
+            return None, None
+        elif fmt == 'png' and b'IEND' not in decrypted[-12:]:
+            # 末尾不含 IEND chunk → XOR key 错误
+            return None, None
 
     if out_path is None:
         base = os.path.splitext(dat_path)[0]
@@ -193,6 +220,11 @@ def v2_decrypt_file(dat_path, out_path=None, aes_key=None, xor_key=0x88):
                 base = base[:-len(suffix)]
                 break
         out_path = f"{base}.{fmt}"
+    else:
+        # 确保扩展名正确
+        base, ext = os.path.splitext(out_path)
+        if ext.lower() != f'.{fmt}':
+            out_path = f"{base}.{fmt}"
 
     os.makedirs(os.path.dirname(out_path), exist_ok=True)
     with open(out_path, 'wb') as f:
@@ -230,30 +262,34 @@ def xor_decrypt_file(dat_path, out_path=None, key=None):
     return out_path, fmt
 
 
-def decrypt_dat_file(dat_path, out_path=None, aes_key=None, xor_key=0x88):
+def decrypt_dat_file(dat_path, out_path=None, aes_key=None, xor_key=None, force_key=None):
     """智能解密 .dat 文件 (自动检测格式)
 
     Args:
         dat_path: .dat 文件路径
         out_path: 输出路径
         aes_key: V2 格式的 AES key (str 或 bytes, 16 字节)
-        xor_key: XOR key (int)
+        xor_key: XOR key (int, 默认从 config 读取)
+        force_key: 强制使用的 key，如果传入则直接用此 key 解密
 
     Returns:
         (output_path, format) 或 (None, None)
     """
+    if xor_key is None:
+        xor_key = _cfg.get("image_xor_key", 0x88)
+
+    if force_key:
+        return v2_decrypt_file(dat_path, out_path, force_key, xor_key)
+
     with open(dat_path, 'rb') as f:
         head = f.read(6)
 
-    # V2 新格式
     if head == V2_MAGIC_FULL:
         return v2_decrypt_file(dat_path, out_path, aes_key, xor_key)
 
-    # V1 格式 (固定 AES key)
     if head == V1_MAGIC_FULL:
         return v2_decrypt_file(dat_path, out_path, b'cfcd208495d565ef', xor_key)
 
-    # 旧 XOR 格式
     return xor_decrypt_file(dat_path, out_path)
 
 
@@ -299,17 +335,19 @@ def extract_md5_from_packed_info(blob):
 class ImageResolver:
     """封装从 local_id 到图片文件的完整解析链"""
 
-    def __init__(self, wechat_base_dir, decoded_image_dir, cache):
+    def __init__(self, wechat_base_dir, decoded_image_dir, cache, aes_key=None):
         """
         Args:
             wechat_base_dir: 微信数据根目录 (如 D:\\xwechat_files\\<wxid>)
             decoded_image_dir: 解密图片输出目录
             cache: DBCache 实例，用于解密 message_resource.db
+            aes_key: V2 格式 AES key (可选，默认从 config.json 读取)
         """
         self.base_dir = wechat_base_dir
         self.attach_dir = os.path.join(wechat_base_dir, "msg", "attach")
         self.out_dir = decoded_image_dir
         self.cache = cache
+        self.aes_key = aes_key if aes_key is not None else _cfg.get("image_aes_key")
 
     def get_image_md5(self, local_id):
         """通过 local_id 查 message_resource.db 获取图片文件 MD5"""
@@ -320,12 +358,12 @@ class ImageResolver:
         conn = sqlite3.connect(path)
         try:
             row = conn.execute(
-                "SELECT packed_info FROM MessageResourceInfo WHERE local_id = ?",
+                "SELECT packed_info FROM MessageResourceInfo WHERE message_local_id = ?",
                 (local_id,)
             ).fetchone()
             if row and row[0]:
                 return extract_md5_from_packed_info(row[0])
-        except Exception:
+        except Exception as e:
             pass
         finally:
             conn.close()
@@ -351,47 +389,47 @@ class ImageResolver:
 
         return sorted(results)
 
-    def decode_image(self, username, local_id):
+    def decode_image(self, username, local_id, xml_md5=None):
         """完整流程：local_id → MD5 → .dat → 解密
 
+        Args:
+            username: 微信号/群号
+            local_id: 消息 local_id
+            xml_md5: 从消息 XML 中提取的 MD5（message_resource.db 查不到时使用）
         Returns:
             dict with keys: success, path, format, md5, error
         """
-        # 1. 获取 MD5
         file_md5 = self.get_image_md5(local_id)
         if not file_md5:
-            return {'success': False, 'error': f'无法从 message_resource.db 找到 local_id={local_id} 的图片信息'}
+            # 回退：使用调用方从 XML 消息内容中提取的 MD5
+            if xml_md5:
+                file_md5 = xml_md5
+            else:
+                return {'success': False, 'error': f'无法从 message_resource.db 找到 local_id={local_id} 的图片信息'}
 
-        # 2. 找 .dat 文件
         dat_files = self.find_dat_files(username, file_md5)
         if not dat_files:
             return {'success': False, 'error': f'找不到 .dat 文件 (MD5={file_md5})', 'md5': file_md5}
 
-        # 优先选标准版（非 _t/_h），然后高清 _h，最后缩略图 _t
-        selected = dat_files[0]
-        for f in dat_files:
-            fname = os.path.basename(f)
-            if not fname.startswith(file_md5 + '_'):
-                selected = f
-                break
-        for f in dat_files:
-            if f.endswith('_h.dat'):
-                selected = f
-                break
+        h_file = next((f for f in dat_files if f.endswith('_h.dat')), None)
+        if h_file:
+            selected = h_file
+        else:
+            selected = next((f for f in dat_files if not f.endswith('_t.dat')), dat_files[0])
 
-        # 3. 解密
         out_name = f"{file_md5}"
         out_path_base = os.path.join(self.out_dir, out_name)
 
-        result_path, fmt = xor_decrypt_file(selected, f"{out_path_base}.tmp")
+        result_path, fmt = decrypt_dat_file(selected, f"{out_path_base}.tmp", self.aes_key)
         if not result_path:
-            return {'success': False, 'error': f'无法检测 XOR key (文件: {selected})', 'md5': file_md5}
+            return {'success': False, 'error': f'解密失败，可能缺少有效的 V2 AES key (文件: {selected})', 'md5': file_md5}
 
         # 重命名为正确扩展名
         final_path = f"{out_path_base}.{fmt}"
-        if os.path.exists(final_path):
-            os.unlink(final_path)
-        os.rename(result_path, final_path)
+        if result_path != final_path:
+            if os.path.exists(final_path):
+                os.unlink(final_path)
+            os.rename(result_path, final_path)
 
         return {
             'success': True,
@@ -445,14 +483,53 @@ if __name__ == "__main__":
     if len(sys.argv) < 2:
         print("用法: python decode_image.py <dat_file> [output_file]")
         print("  解密单个 .dat 文件")
+        print("  --debug   显示详细诊断信息（检测 AES/XOR key 有效性）")
         sys.exit(1)
 
-    dat_file = sys.argv[1]
-    out_file = sys.argv[2] if len(sys.argv) > 2 else None
+    debug = '--debug' in sys.argv
+    args = [a for a in sys.argv[1:] if a != '--debug']
+    dat_file = args[0]
+    out_file = args[1] if len(args) > 1 else None
 
     if not os.path.exists(dat_file):
         print(f"文件不存在: {dat_file}")
         sys.exit(1)
+
+    if debug:
+        with open(dat_file, 'rb') as f:
+            head = f.read(32)
+        file_size = os.path.getsize(dat_file)
+        print(f"文件大小: {file_size:,} bytes")
+        print(f"文件头 (hex): {head.hex()}")
+        if head[:6] == V2_MAGIC_FULL:
+            aes_size, xor_size = struct.unpack_from('<LL', head, 6)
+            aligned_aes = (aes_size + 15) // 16 * 16
+            raw_size = file_size - 15 - aligned_aes - xor_size
+            print(f"V2 格式: aes_size={aes_size}, xor_size={xor_size}, raw_size={raw_size}")
+            print(f"配置 image_aes_key={_cfg.get('image_aes_key')!r}, image_xor_key=0x{_cfg.get('image_xor_key', 0x88):02X}")
+            # 检测 AES key 效果
+            from Crypto.Cipher import AES as _AES
+            aes_key = _cfg.get("image_aes_key", "")
+            if aes_key:
+                with open(dat_file, 'rb') as f:
+                    f.seek(15)
+                    blk = f.read(16)
+                cipher = _AES.new(aes_key.encode('ascii')[:16], _AES.MODE_ECB)
+                dec16 = cipher.decrypt(blk)
+                print(f"AES 解密首 16 字节: {dec16.hex()}  → 格式: {detect_image_format(dec16)}")
+            # 检测 XOR key 效果
+            xor_key = _cfg.get("image_xor_key", 0x88)
+            with open(dat_file, 'rb') as f:
+                f.seek(-2, 2)
+                tail = f.read(2)
+            dec_tail = bytes(b ^ xor_key for b in tail)
+            print(f"文件末 2 字节: {tail.hex()} XOR 0x{xor_key:02X} → {dec_tail.hex()} (期望 ffd9 for JPEG)")
+        elif head[:6] == V1_MAGIC_FULL:
+            print("V1 格式（固定 key）")
+        else:
+            detected_key = detect_xor_key(dat_file)
+            print(f"旧格式 XOR, 检测 key: 0x{detected_key:02X}" if detected_key is not None else "旧格式 XOR, 无法检测 key")
+        print("---")
 
     result_path, fmt = decrypt_dat_file(dat_file, out_file)
     if result_path:
