@@ -184,7 +184,7 @@ class DBCache:
         except OSError:
             pass
 
-    def get(self, rel_key):
+    def get(self, rel_key, force=False):
         key_info = get_key_info(ALL_KEYS, rel_key)
         if not key_info:
             return None
@@ -200,7 +200,7 @@ class DBCache:
         except OSError:
             return None
 
-        if rel_key in self._cache:
+        if not force and rel_key in self._cache:
             c_db_mt, c_wal_mt, c_path = self._cache[rel_key]
             if c_db_mt == db_mtime and c_wal_mt == wal_mtime and os.path.exists(c_path):
                 return c_path
